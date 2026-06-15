@@ -1,0 +1,28 @@
+# ── Credenciales y secretos ──────────────────────────────────────
+.env.dev
+.env.qa
+.env.prd
+secrets/.env.secrets
+secrets/.env.secrets.*
+!secrets/.env.secrets.example
+
+# ── Logs (bind-mount solo en DEV) ────────────────────────────────
+Logs/
+
+# ── Python ───────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# ── Node ─────────────────────────────────────────────────────────
+volumenes/web/node_modules/
+volumenes/web/dist/
+
+# ── OS / Editor ──────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp

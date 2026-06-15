@@ -1,0 +1,482 @@
+# ==========================================================
+# Genosha — docker-compose DEV
+# Todos los puertos expuestos para facilitar debugging.
+# Ejecutar con: bash docker_tools_v3.sh  (desde Sistema/)
+# ==========================================================
+
+name: genosha
+
+x-labels: &labels
+  stack: ${PROJECT_NAME}
+  env: ${ENV}
+
+x-base: &base
+  restart: unless-stopped
+  networks:
+    - genosha-network
+
+networks:
+  genosha-network:
+    name: ${PROJECT_NAME}-network
+    driver: bridge
+
+# Volúmenes Docker para infraestructura (BD, cache, vectores, objetos)
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  minio_data:
+
+services:
+
+  # ============================================================
+  # DEPENDENCY GROUP — Infraestructura (volúmenes Docker)
+  # ============================================================
+
+  postgres:
+    <<: *base
+    container_name: ${PROJECT_NAME}-postgres
+    image: postgres:16-alpine
+    labels:
+      <<: *labels
+      service.group: dependency
+      service.lifecycle: long-running
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ${LOGS_ROOT}/${ENV}/postgres:/var/log/postgresql
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  redis:
+    <<: *base
+    container_name: ${PROJECT_NAME}-redis
+    image: redis:7-alpine
+    labels:
+      <<: *labels
+      service.group: dependency
+      service.lifecycle: long-running
+    volumes:
+      - redis_data:/data
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  qdrant:
+    <<: *base
+    container_name: ${PROJECT_NAME}-qdrant
+    image: qdrant/qdrant:v1.13.3
+    labels:
+      <<: *labels
+      service.group: dependency
+      service.lifecycle: long-running
+    volumes:
+      - qdrant_data:/qdrant/storage
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "${QDRANT_PORT:-6333}:6333"
+      - "6334:6334"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  minio:
+    <<: *base
+    container_name: ${PROJECT_NAME}-minio
+    image: minio/minio:RELEASE.2025-07-23T15-54-02Z
+    labels:
+      <<: *labels
+      service.group: dependency
+      service.lifecycle: long-running
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "${MINIO_PORT:-9000}:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9000/minio/health/live || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  gotenberg:
+    <<: *base
+    container_name: ${PROJECT_NAME}-gotenberg
+    image: gotenberg/gotenberg:8
+    labels:
+      <<: *labels
+      service.group: dependency
+      service.lifecycle: long-running
+    volumes:
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "3001:3000"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # ============================================================
+  # CORE GROUP — Servicios de aplicación (código en volumenes/)
+  # ============================================================
+
+  web:
+    <<: *base
+    container_name: ${PROJECT_NAME}-web
+    build:
+      context: ./volumenes/web
+      dockerfile: ../../DockerFiles/web/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    volumes:
+      - ./volumenes/web:/app
+      - /app/node_modules
+      - ${LOGS_ROOT}/${ENV}/web:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  api:
+    <<: *base
+    container_name: ${PROJECT_NAME}-api
+    build:
+      context: ./volumenes/api
+      dockerfile: ../../DockerFiles/api/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_URL: ${REDIS_URL}
+      QDRANT_URL: ${QDRANT_URL}
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      SECRET_KEY: ${SECRET_KEY}
+      DEBUG: ${DEBUG}
+    volumes:
+      - ./volumenes/api:/app
+      - ${LOGS_ROOT}/${ENV}/api:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8000/api/v1/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  scheduler:
+    <<: *base
+    container_name: ${PROJECT_NAME}-scheduler
+    build:
+      context: ./volumenes/scheduler
+      dockerfile: ../../DockerFiles/scheduler/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+    volumes:
+      - ./volumenes/scheduler:/app
+      - ${LOGS_ROOT}/${ENV}/scheduler:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  ingestion-worker:
+    <<: *base
+    container_name: ${PROJECT_NAME}-ingestion-worker
+    build:
+      context: ./volumenes/ingestion-worker
+      dockerfile: ../../DockerFiles/ingestion-worker/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+    volumes:
+      - ./volumenes/ingestion-worker:/app
+      - ${LOGS_ROOT}/${ENV}/ingestion-worker:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+
+  normalization-worker:
+    <<: *base
+    container_name: ${PROJECT_NAME}-normalization-worker
+    build:
+      context: ./volumenes/normalization-worker
+      dockerfile: ../../DockerFiles/normalization-worker/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+    volumes:
+      - ./volumenes/normalization-worker:/app
+      - ${LOGS_ROOT}/${ENV}/normalization-worker:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  analysis-worker:
+    <<: *base
+    container_name: ${PROJECT_NAME}-analysis-worker
+    build:
+      context: ./volumenes/analysis-worker
+      dockerfile: ../../DockerFiles/analysis-worker/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      QDRANT_URL: ${QDRANT_URL}
+    volumes:
+      - ./volumenes/analysis-worker:/app
+      - ${LOGS_ROOT}/${ENV}/analysis-worker:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  orchestrator:
+    <<: *base
+    container_name: ${PROJECT_NAME}-orchestrator
+    build:
+      context: ./volumenes/orchestrator
+      dockerfile: ../../DockerFiles/orchestrator/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+    volumes:
+      - ./volumenes/orchestrator:/app
+      - ${LOGS_ROOT}/${ENV}/orchestrator:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  vector-worker:
+    <<: *base
+    container_name: ${PROJECT_NAME}-vector-worker
+    build:
+      context: ./volumenes/vector-worker
+      dockerfile: ../../DockerFiles/vector-worker/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      QDRANT_URL: ${QDRANT_URL}
+    volumes:
+      - ./volumenes/vector-worker:/app
+      - ${LOGS_ROOT}/${ENV}/vector-worker:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  reporting-worker:
+    <<: *base
+    container_name: ${PROJECT_NAME}-reporting-worker
+    build:
+      context: ./volumenes/reporting-worker
+      dockerfile: ../../DockerFiles/reporting-worker/Dockerfile
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    environment:
+      ENV: ${ENV}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND}
+      MINIO_HOST: ${MINIO_HOST}
+      MINIO_PORT: ${MINIO_PORT}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+      GOTENBERG_URL: ${GOTENBERG_URL}
+    volumes:
+      - ./volumenes/reporting-worker:/app
+      - ${LOGS_ROOT}/${ENV}/reporting-worker:/app/logs
+      - ${SHARE_ROOT}:/genosha/share
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      gotenberg:
+        condition: service_healthy
+
+  proxy:
+    <<: *base
+    container_name: ${PROJECT_NAME}-proxy
+    image: nginx:1.26-alpine
+    labels:
+      <<: *labels
+      service.group: core
+      service.lifecycle: long-running
+    volumes:
+      - ${CONFIGS_ROOT}/nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ${LOGS_ROOT}/${ENV}/proxy:/var/log/nginx
+      - ${SHARE_ROOT}:/genosha/share
+    ports:
+      - "80:80"
+    depends_on:
+      - web
+      - api
+
+  # ============================================================
+  # TOOLS GROUP — Herramientas de desarrollo (opcional: --profile tools)
+  # ============================================================
+
+  mailpit:
+    <<: *base
+    container_name: ${PROJECT_NAME}-mailpit
+    image: axllent/mailpit:v1.30.1
+    labels:
+      <<: *labels
+      service.group: tools
+      service.lifecycle: long-running
+    profiles:
+      - tools
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8025/api/v1/info || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
